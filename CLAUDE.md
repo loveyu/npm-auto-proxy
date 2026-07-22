@@ -1,0 +1,68 @@
+## 项目概述
+
+npm-auto-proxy 是一个面向 npm registry 的高并发 HTTP 路径转发代理（Go 1.24），设计上放在 Verdaccio 等前置作为上游转发器。对每个请求**并发竞速 HEAD 探测**多个上游，再从**最高优先级的健康上游**下载，下载失败自动回退到下一个。每个上游可单独配置固定 IP 解析与 HTTP/SOCKS5 代理。
+
+## 常用命令
+
+构建 / 运行：
+- `./build.sh v1.0.0` — 构建二进制并通过 ldflags 注入 `main.version`
+- `go build` — 普通构建
+- `./npm-auto-proxy start` — 启动（不带子命令时默认即 `start`）
+- `DEBUG=1 ./npm-auto-proxy start` — 开启 per-request debug 日志
+- `./npm-auto-proxy check` — 逐个探测上游连通性（全部成功 exit 0，否则 exit 1）
+
+质量：
+- `go vet ./...` — 静态检查
+- `go test ./...` — 全量测试
+- `go test ./internal/proxy/ -run TestRaceSkipsUnhealthy` — 运行单个测试
+- `go test -race ./...` — 竞速检测（HEAD race 的并发测试在 `router_race_test.go`，改动竞速逻辑时务必带 `-race`）
+
+环境变量：
+- `CONFIG_PATH` — 配置文件路径（默认 `config.yaml`）
+- `DEBUG` — 任意非空值开启 debug 日志
+- `REMOTE_CONFIG_URL` — `download-config` 子命令下载配置的目标 URL
+- 启动时自动读取可选的 `.env`，已有环境变量不被覆盖（见 `main.go:loadEnv`）
+
+## 架构
+
+`main.go` 按子命令分发：加载 config → 构建 `proxy.Router` → 交给 `httpserver.Server`。核心逻辑集中在 `internal/proxy`。
+
+### 请求的两阶段策略（最重要的"大局"）
+
+`Router.ServeHTTP` 做最长前缀路由匹配，命中后交给 `compiledRoute.serve`，后者按方法分三条路径：
+
+1. **单候选**：直接 `Forward`，失败回 502。
+2. **GET**：先 `raceHead` 并发 HEAD 探测所有候选 → 得到健康上游 → 按 priority 升序逐个下载，某上游 `Forward` 失败则回退下一个；全部失败回 502。
+3. **非 GET**：请求 body 只能被消费一次，**既无法 race 也无法回退**，只转发给最高优先级候选。
+
+改动请求流程时必须同时兼顾 GET 的回退链与非 GET 的"一锤定音"差异。
+
+### HEAD race 三段式（`raceHead` / `raceHeadOnce`）
+
+- 并发对所有候选发 HEAD，先等 `strategy.head.firstTimeout` 内的**首个**成功；
+- 首个成功后把等待重置为 `strategy.head.grace`，给其余上游一个宽限期；
+- 若整轮全部超时，按 `strategy.head.retries` 重跑整轮（总尝试 = retries+1）；
+- status 在 `[200, 400)` 视为健康。
+
+### `Upstream.Forward` 的返回约定（fallback 的基石）
+
+`Forward` 返回 `true` 表示响应**已提交**（status < 400）；返回 `false` 表示连接/协议错误或上游 ≥ 400，此时**绝不向 ResponseWriter 写入任何字节**，把回退或 502 的决定权留给 `serve`。任何改动都要保持"false 即零写入"这一不变式，否则回退链会写出脏响应。
+
+### 优先级语义
+
+`priority` **数值越小越优先**（commit `1a273ed` 刚把语义从"大=优先"翻转过来，改代码时不要看旧直觉）。`sortByPriority` 做升序稳定排序，下载顺序与健康列表排序都依赖它。
+
+### 每上游独立运行时（`internal/proxy/upstream.go`）
+
+每个上游有独立的 `http.Transport`（连接池）和两个 client：`headClient`（不跟随重定向）与 `forwardClient`（跟随重定向，带下载超时）。可选能力在 `buildTransport` 内按顺序叠加：先 `resolve`（固定 IP 拨号，保留 Host 头 / TLS SNI），再 `proxy`（`http`/`https`/`socks5`/`socks5h`，proxy 启用时优先于 resolve）。
+
+### 配置加载（`internal/config/config.go`）
+
+`Load` 顺序：填默认值 → YAML 解析 → `normalizeRoutes`（候选来源优先级：`upstreams` > `upstream` > 全部上游）→ `validate` → 按最长前缀稳定排序路由（保证 `/` 兜底不淹没具体路由）。所有时长字段经 `parseDurationDefault`，空串回落到默认值。
+
+### 日志分层
+
+- `Upstream` 层（download 失败、HEAD 整轮重试等）用 `log.Printf` **无条件**输出，属运维必需的错误日志，生产环境也保留。
+- per-request 的路由匹配 / HEAD 竞速 / 回退细节由 `Router.debug`（`DEBUG` 环境变量）控制，经 `(*Router).debugf` 输出带 `[debug]` 前缀的行，关闭时为零开销空函数。
+
+约定：新增请求级诊断信息走 `debugf`（仅 debug 时可见），新增真实错误走 `log.Printf`（始终可见）。

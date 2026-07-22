@@ -24,8 +24,8 @@ strategy:
 upstreams:
   # 上游1：内网镜像（最快，最优先）。固定 IP 解析，绕过 DNS，保留 Host 头与 SNI。
   - name: intra
-    url: http://npm-registry.zuzuche.net
-    resolve: 10.2.251.99
+    url: http://your-intranet-registry.example.com
+    resolve: 10.0.0.10
     priority: 1
 
   # 上游2：公网 npmmirror（次优先，快且全）。
