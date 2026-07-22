@@ -60,6 +60,17 @@ rewrite:
   enabled: false        # 总开关（默认关，不影响现有行为）
   # externalUrl: http://127.0.0.1:8080   # 显式指定重写 base；留空则按每个请求动态推断
 
+# tarball 磁盘缓存（可选，整段省略即关闭）。仅缓存压缩包（.tgz/.tar.gz/.zip/...），
+# 包元数据永不缓存；永久缓存（无 TTL / 无淘汰）。命中即绕过上游直接回源；
+# 同路径并发请求按路径加锁去重，只下载一次。写入采用「临时文件 + 原子改名」，并发安全。
+# directories 为数组：type=read（默认，只读）按顺序参与读取；type=write 同时读写，最多一个。
+cache:
+  directories:
+    # - path: /home/you/.local/share/pnpm/store   # 只读：复用本机已有缓存目录
+    #   type: read
+    - path: /var/cache/npm-auto-proxy   # 写入目录（同时参与读取）；最多一个 write
+      type: write
+
 # 更多可选字段（每个 upstream）：
 #   maxIdleConns / idleConnsPerHost  : 连接池大小（默认 100 / 32）
 #   insecureSkipVerify               : 跳过上游 TLS 校验（谨慎使用）

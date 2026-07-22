@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"npm-auto-proxy/internal/cache"
 	"npm-auto-proxy/internal/config"
 )
 
@@ -21,6 +22,7 @@ type Router struct {
 	headGrace   time.Duration // extra wait after the first success
 	headRetries int           // re-run the whole race if every probe times out
 	debug       bool          // emit per-request debug logs
+	cache       *cache.Cache  // optional tarball cache; nil when caching is disabled
 }
 
 // requestInfo carries per-request tracing data (the upstream that served the
@@ -64,13 +66,33 @@ func NewRouter(cfg *config.Config) (*Router, error) {
 		log.Printf("route %s -> %v (stripPrefix=%v)", r.Prefix, r.Upstreams, r.StripPrefix)
 	}
 
+	var ch *cache.Cache
+	if len(cfg.Cache.Directories) > 0 {
+		c, err := cache.New(cfg.CacheReadDirs(), cfg.CacheWriteDir(), config.IsDebug())
+		if err != nil {
+			return nil, fmt.Errorf("cache: %w", err)
+		}
+		ch = c
+		log.Printf("cache: readDirs=%v writeDir=%q", cfg.CacheReadDirs(), cfg.CacheWriteDir())
+	}
+
 	return &Router{
 		routes:      routes,
 		headFirst:   cfg.HeadFirstTimeoutDur(),
 		headGrace:   cfg.HeadGraceDur(),
 		headRetries: cfg.HeadRetries(),
 		debug:       config.IsDebug(),
+		cache:       ch,
 	}, nil
+}
+
+// captureWriter wraps w for tarball caching when applicable; otherwise it returns
+// the original writer and a nil finalizer.
+func (r *Router) captureWriter(w http.ResponseWriter, req *http.Request) (http.ResponseWriter, func(bool)) {
+	if r.cache == nil {
+		return w, nil
+	}
+	return r.cache.Capture(w, req)
 }
 
 // Upstreams returns the upstreams referenced by any route (sorted by name) for the check command.
@@ -111,11 +133,48 @@ func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Rout
 	path := cr.strip(req.URL.Path)
 	candidates := cr.upstreams
 
+	// Fast path: a cached tarball is served straight from disk, bypassing
+	// upstreams, per-path locking, and HEAD racing.
+	if req.Method == http.MethodGet && r.cache != nil && r.cache.ServeHit(w, req) {
+		info.upstream = "served by cache"
+		return
+	}
+
+	// Serialize per-path downloads so concurrent identical requests share a
+	// single upstream fetch: the first downloads and caches the tarball,
+	// followers wait then serve the just-cached file. Held until function return
+	// so the cached file is in place before any waiter proceeds. No-op (nil, nil)
+	// when caching is disabled or the path is not a cacheable GET.
+	mu, release := r.cache.Acquire(req)
+	if mu != nil {
+		mu.Lock()
+		defer func() {
+			mu.Unlock()
+			release()
+		}()
+		// A concurrent leader may have cached the file while we waited.
+		if r.cache.ServeHit(w, req) {
+			info.upstream = "served by cache"
+			return
+		}
+	}
+
+	// Tee tarball downloads into the cache. ww == w and finalize == nil when the
+	// path is not cacheable (no write dir / not a tarball), so this is zero
+	// overhead for metadata and other responses.
+	ww, finalize := r.captureWriter(w, req)
+
 	// Single candidate: no race needed.
 	if len(candidates) == 1 {
-		if candidates[0].Forward(req.Context(), w, req, path) {
+		if candidates[0].Forward(req.Context(), ww, req, path) {
+			if finalize != nil {
+				finalize(true)
+			}
 			info.upstream = "served by " + candidates[0].Name()
 			return
+		}
+		if finalize != nil {
+			finalize(false)
 		}
 		info.upstream = "502 upstream " + candidates[0].Name() + " unreachable"
 		http.Error(w, "upstream unreachable", http.StatusBadGateway)
@@ -131,11 +190,17 @@ func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Rout
 			alive = sortByPriority(candidates) // race fully failed: best-effort by priority
 		}
 		for _, u := range alive {
-			if u.Forward(req.Context(), w, req, path) {
+			if u.Forward(req.Context(), ww, req, path) {
+				if finalize != nil {
+					finalize(true)
+				}
 				info.upstream = "served by " + u.Name()
 				return
 			}
 			r.debugf("   %s %s: upstream %q failed, falling back", req.Method, req.URL.Path, u.Name())
+		}
+		if finalize != nil {
+			finalize(false)
 		}
 		info.upstream = "502 all upstreams failed"
 		http.Error(w, "all upstreams failed", http.StatusBadGateway)
@@ -145,9 +210,15 @@ func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Rout
 	// Non-GET: the request body can be consumed only once, so try just the
 	// highest-priority candidate without racing or fallback.
 	ordered := sortByPriority(candidates)
-	if ordered[0].Forward(req.Context(), w, req, path) {
+	if ordered[0].Forward(req.Context(), ww, req, path) {
+		if finalize != nil {
+			finalize(true)
+		}
 		info.upstream = "served by " + ordered[0].Name()
 		return
+	}
+	if finalize != nil {
+		finalize(false)
 	}
 	info.upstream = "502 upstream " + ordered[0].Name() + " failed"
 	http.Error(w, "upstream failed", http.StatusBadGateway)

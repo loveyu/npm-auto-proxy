@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -16,6 +18,7 @@ type Config struct {
 	HTTP      HTTPConfig     `yaml:"http"`
 	Strategy  StrategyConfig `yaml:"strategy"`
 	Rewrite   RewriteConfig  `yaml:"rewrite"`
+	Cache     CacheConfig    `yaml:"cache"`
 	Upstreams []Upstream     `yaml:"upstreams"`
 	Routes    []Route        `yaml:"routes"`
 }
@@ -90,6 +93,21 @@ type RewriteConfig struct {
 	ExternalURL string `yaml:"externalUrl"` // Optional explicit base, e.g. "http://127.0.0.1:48180". Empty = derive per request.
 }
 
+// CacheConfig controls the optional on-disk tarball cache. Only compressed
+// package artifacts (tarballs: .tgz/.tar.gz/.zip/...) are cached — never package
+// metadata. The cache is permanent: there is no TTL, eviction, or size limit.
+// Directories are searched for reads in listed order; at most one directory may
+// be Type "write" (a write directory also serves reads).
+type CacheConfig struct {
+	Directories []CacheDirectory `yaml:"directories"`
+}
+
+// CacheDirectory is one cache location.
+type CacheDirectory struct {
+	Path string `yaml:"path"` // required
+	Type string `yaml:"type"` // "read" (default) or "write". Write also serves reads.
+}
+
 // Load reads, parses, defaults and validates the configuration file.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -125,6 +143,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.normalizeRoutes()
+	cfg.normalizeCache()
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -133,6 +152,25 @@ func Load(path string) (*Config, error) {
 	// regardless of the order they were written in the YAML.
 	sortRoutesLongestFirst(cfg.Routes)
 	return cfg, nil
+}
+
+// normalizeCache trims/defaults cache directory entries: an empty Type defaults
+// to "read", and relative paths are resolved to absolute (against the process
+// working directory) so cache keys map consistently regardless of CWD.
+func (c *Config) normalizeCache() {
+	for i := range c.Cache.Directories {
+		d := &c.Cache.Directories[i]
+		d.Type = strings.ToLower(strings.TrimSpace(d.Type))
+		if d.Type == "" {
+			d.Type = "read"
+		}
+		d.Path = strings.TrimSpace(d.Path)
+		if d.Path != "" {
+			if abs, err := filepath.Abs(d.Path); err == nil {
+				d.Path = abs
+			}
+		}
+	}
 }
 
 // normalizeRoutes expands each route's candidate list: Upstreams wins, then the
@@ -161,6 +199,25 @@ func (c *Config) validate() error {
 		if err != nil || u.Scheme == "" || u.Host == "" {
 			return fmt.Errorf("rewrite.externalUrl %q: must be an absolute URL like http://host:port", c.Rewrite.ExternalURL)
 		}
+	}
+	// Cache directories: each needs a path and a valid type; at most one writer.
+	writers := 0
+	for i := range c.Cache.Directories {
+		d := &c.Cache.Directories[i]
+		if d.Path == "" {
+			return fmt.Errorf("cache.directories[%d]: path is required", i)
+		}
+		switch d.Type {
+		case "read", "write":
+		default:
+			return fmt.Errorf("cache.directories[%d]: type %q must be \"read\" or \"write\"", i, d.Type)
+		}
+		if d.Type == "write" {
+			writers++
+		}
+	}
+	if writers > 1 {
+		return fmt.Errorf("cache.directories: at most one entry may be type \"write\" (got %d)", writers)
 	}
 	if len(c.Upstreams) == 0 {
 		return fmt.Errorf("no upstreams configured")
@@ -223,6 +280,29 @@ func (c *Config) RewriteEnabled() bool { return c.Rewrite.Enabled }
 
 // RewriteExternalURL returns the explicit rewrite base URL, or "" to derive per request.
 func (c *Config) RewriteExternalURL() string { return c.Rewrite.ExternalURL }
+
+// CacheReadDirs returns every cache directory that can serve reads (all of them,
+// in configured order — write directories read as well), or nil if caching is off.
+func (c *Config) CacheReadDirs() []string {
+	if len(c.Cache.Directories) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(c.Cache.Directories))
+	for _, d := range c.Cache.Directories {
+		out = append(out, d.Path)
+	}
+	return out
+}
+
+// CacheWriteDir returns the single write cache directory, or "" if there is none.
+func (c *Config) CacheWriteDir() string {
+	for _, d := range c.Cache.Directories {
+		if d.Type == "write" {
+			return d.Path
+		}
+	}
+	return ""
+}
 
 func (c *Config) ReadTimeoutDur() time.Duration {
 	return parseDurationDefault(c.HTTP.ReadTimeout, 0)

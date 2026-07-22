@@ -56,6 +56,18 @@ npm-auto-proxy 是一个面向 npm registry 的高并发 HTTP 路径转发代理
 
 > 注意：像 Verdaccio 这类**自身也会重写 tarball URL** 的下游，会基于客户端 Host 覆盖本代理的重写，此时本功能对它无效，需在下游 / 反向代理层另行处理（例如让反代把 tarball 请求直接转给本代理）。
 
+### tarball 磁盘缓存（cache，`internal/cache/`）
+
+可选功能，配置 `cache.directories`（数组，每项 `{path, type}`，`type` ∈ `read`（默认）/`write`，**最多一个 `write`**）即开启。**仅缓存压缩包**——`isCachablePath` 判定路径以 `.tgz`/`.tar.gz`/`.zip`/`.gz`/... 结尾；包元数据路径无此后缀，天然不缓存。缓存**永久**（无 TTL / 无淘汰 / 无容量上限）。缓存键即**请求路径**（`cacheRelPath`：剥前导 `/`、拒绝 `..` 防穿越；带查询串时追加短哈希避免碰撞），例如 `/@scope/pkg/-/pkg-1.0.0.tgz` → `<writeDir>/@scope/pkg/-/pkg-1.0.0.tgz`。**不**兼容 pnpm 的 content-addressable store（pnpm 存的是解压后的单文件 blob，无整包 tarball 可读），缓存目录是本代理自管的目录。
+
+`Router` 持有 `*cache.Cache`（`NewRouter` 从 `cfg.CacheReadDirs()`/`cfg.CacheWriteDir()` 构建，无缓存配置时为 nil）。`compiledRoute.serve` 里两处接入（均在 GET 且命中可缓存路径时）：
+
+1. **读命中（`ServeHit`）**：在竞速 / 加锁之前先查所有读目录（含 write 目录）。命中即直接流式回客户端（`Content-Type: application/octet-stream`、`Content-Length`、`X-Cache: HIT`），**完全绕过** HEAD 竞速与上游下载。
+2. **按路径加锁去重（`Acquire`）**：读未命中后，`Acquire` 返回按缓存键分桶的 `*sync.Mutex`（引用计数，最后一个释放时从 map 删除，避免无限增长）。持锁期间再次 `ServeHit`（可能已被并发的前一个 leader 缓存）；故同一路径并发请求只下载一次，其余等待后命中缓存。锁在 `serve` 返回时释放（`defer`），保证缓存文件落盘后才放行后续 waiter。
+3. **写入（`Capture` + `teeResponseWriter`）**：`captureWriter` 把 `w` 包成 tee，下载字节边流给客户端边 tee 到 `<writeDir>/.tmp/cap-*` 临时文件。`finalize(true)` 用 `os.MkdirAll` + `os.Rename` **原子落盘**（同文件系统，POSIX rename 原子替换目标，并发写入互不冲突）；失败 / 未写入时 `finalize(false)` 删除临时文件。`New` 时清理上次崩溃残留的 `.tmp` 临时文件。
+
+**保持 `Forward` 的零写入不变式**：失败（`Forward` 返回 false）时不写入任何字节，临时文件根本不会创建（懒创建于首次 `Write`），`finalize(false)` 是廉价 no-op。另：`teeResponseWriter.truncated` 比对响应头 `Content-Length` 与实际写入字节，**上游中途断流时丢弃残缺包**（`Forward` 在 status<400 时即便 `io.Copy` 出错也返回 true，靠此守卫避免缓存截断的 tarball）；客户端断开（`Write` 报错）时 `writeErr` 置位同样丢弃。非可缓存路径 / 无 write 目录 / 非 GET 时 `Capture` 原样返回 `(w, nil)`，零开销。
+
 ### 优先级语义
 
 `priority` **数值越小越优先**（commit `1a273ed` 刚把语义从"大=优先"翻转过来，改代码时不要看旧直觉）。`sortByPriority` 做升序稳定排序，下载顺序与健康列表排序都依赖它。

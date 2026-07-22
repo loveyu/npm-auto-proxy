@@ -133,6 +133,11 @@ Routing:
   forwarded to the matching upstream's registry URL. Each upstream may optionally
   route through an HTTP or SOCKS5 proxy.
 
+Cache:
+  Optionally cache downloaded tarballs (.tgz/.tar.gz/.zip/...) to disk via the
+  cache.directories config (metadata is never cached). Hits are served directly,
+  bypassing upstream; concurrent identical requests are de-duplicated per path.
+
 `)
 }
 

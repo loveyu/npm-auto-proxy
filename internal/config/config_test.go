@@ -105,3 +105,46 @@ func TestRewriteConfigValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestCacheConfigValidation(t *testing.T) {
+	base := "upstreams: [{name: a, url: https://x}]\nroutes: [{prefix: /, upstream: a}]\n"
+	cases := []struct {
+		name   string
+		yaml   string
+		ok     bool
+		writeN int // expected: 0 = no write dir, 1 = one write dir
+		readN  int // expected total read dirs
+	}{
+		{"no cache", base, true, 0, 0},
+		{"one read", "cache:\n  directories:\n    - path: /tmp/c1\n" + base, true, 0, 1},
+		{"explicit read type", "cache:\n  directories:\n    - path: /tmp/c1\n      type: read\n" + base, true, 0, 1},
+		{"one write", "cache:\n  directories:\n    - path: /tmp/c1\n      type: write\n" + base, true, 1, 1},
+		{"read plus write", "cache:\n  directories:\n    - {path: /tmp/c1}\n    - {path: /tmp/c2, type: write}\n" + base, true, 1, 2},
+		{"two writes", "cache:\n  directories:\n    - {path: /tmp/c1, type: write}\n    - {path: /tmp/c2, type: write}\n" + base, false, 0, 0},
+		{"bad type", "cache:\n  directories:\n    - {path: /tmp/c1, type: sync}\n" + base, false, 0, 0},
+		{"empty path", "cache:\n  directories:\n    - {type: read}\n" + base, false, 0, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := writeTempConfig(t, c.yaml)
+			cfg, err := Load(path)
+			if c.ok {
+				if err != nil {
+					t.Fatalf("expected ok, got err: %v", err)
+				}
+				if got := len(cfg.CacheReadDirs()); got != c.readN {
+					t.Errorf("CacheReadDirs len = %d, want %d", got, c.readN)
+				}
+				w := cfg.CacheWriteDir()
+				switch {
+				case c.writeN == 0 && w != "":
+					t.Errorf("CacheWriteDir = %q, want empty", w)
+				case c.writeN == 1 && w == "":
+					t.Error("CacheWriteDir empty, want a write dir")
+				}
+			} else if err == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+		})
+	}
+}
