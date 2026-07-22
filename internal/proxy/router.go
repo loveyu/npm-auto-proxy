@@ -148,7 +148,7 @@ func (r *Router) raceHead(req *http.Request, cr *compiledRoute) []*Upstream {
 			return sortByPriority(healthy)
 		}
 		if attempt < r.headRetries {
-			log.Printf("head race %s: all %d probes timed out, retrying (%d/%d)",
+			log.Printf("head race %s: no healthy upstream after %d probes, retrying (%d/%d)",
 				req.URL.Path, len(cr.upstreams), attempt+1, r.headRetries)
 		}
 	}
