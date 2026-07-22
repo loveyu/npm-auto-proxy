@@ -50,7 +50,7 @@ type DownloadConfig struct {
 type Upstream struct {
 	Name               string      `yaml:"name"`
 	URL                string      `yaml:"url"`
-	Priority           int         `yaml:"priority"`           // Higher = tried first among HEAD-healthy upstreams.
+	Priority           int         `yaml:"priority"`           // Lower number = tried first among HEAD-healthy upstreams.
 	Resolve            string      `yaml:"resolve"`            // Force-dial this IP for the upstream host (keeps Host/SNI).
 	Timeout            string      `yaml:"timeout"`            // Reserved (per-upstream tuning, later stages).
 	MaxIdleConns       int         `yaml:"maxIdleConns"`

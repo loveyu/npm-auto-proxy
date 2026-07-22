@@ -39,6 +39,8 @@ func doGet(t *testing.T, r *Router, path string) (int, string) {
 	return rec.Code, rec.Body.String()
 }
 
+// twoUpstreamRouter wires srvA as the most-preferred candidate (lower priority
+// number) and srvB as the fallback.
 func twoUpstreamRouter(srvA, srvB *httptest.Server, prioA, prioB int, s config.StrategyConfig) (*Router, error) {
 	cfg := &config.Config{
 		Strategy: s,
@@ -51,14 +53,14 @@ func twoUpstreamRouter(srvA, srvB *httptest.Server, prioA, prioB int, s config.S
 	return NewRouter(cfg)
 }
 
-// Unhealthy high-priority upstream must be skipped in favor of a healthy one.
+// The most-preferred upstream being unhealthy must skip to the next healthy one.
 func TestRaceSkipsUnhealthy(t *testing.T) {
 	srvA := backend(http.StatusNotFound, http.StatusOK, "A") // HEAD 404 (unhealthy)
 	defer srvA.Close()
 	srvB := backend(http.StatusOK, http.StatusOK, "B") // HEAD 200 (healthy)
 	defer srvB.Close()
 
-	r, err := twoUpstreamRouter(srvA, srvB, 90, 10, strat("200ms", "50ms", 0))
+	r, err := twoUpstreamRouter(srvA, srvB, 1, 2, strat("200ms", "50ms", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,14 +73,15 @@ func TestRaceSkipsUnhealthy(t *testing.T) {
 	}
 }
 
-// A healthy download failure (>=400) falls back to the next upstream.
+// A download failure (>=400) from the most-preferred healthy upstream falls
+// back to the next.
 func TestDownloadFallback(t *testing.T) {
 	srvA := backend(http.StatusOK, http.StatusInternalServerError, "") // healthy HEAD, 500 GET
 	defer srvA.Close()
 	srvB := backend(http.StatusOK, http.StatusOK, "B")
 	defer srvB.Close()
 
-	r, err := twoUpstreamRouter(srvA, srvB, 90, 10, strat("200ms", "50ms", 0))
+	r, err := twoUpstreamRouter(srvA, srvB, 1, 2, strat("200ms", "50ms", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,14 +95,14 @@ func TestDownloadFallback(t *testing.T) {
 }
 
 // When all HEAD probes are unhealthy, the race exhausts retries and the request
-// degrades to downloading from candidates by priority (highest first).
+// degrades to downloading from candidates by priority (most preferred first).
 func TestHeadAllUnhealthyDegradesByPriority(t *testing.T) {
 	srvA := backend(http.StatusNotFound, http.StatusOK, "A") // HEAD 404
 	defer srvA.Close()
 	srvB := backend(http.StatusNotFound, http.StatusOK, "B") // HEAD 404
 	defer srvB.Close()
 
-	r, err := twoUpstreamRouter(srvA, srvB, 90, 10, strat("40ms", "20ms", 1))
+	r, err := twoUpstreamRouter(srvA, srvB, 1, 2, strat("40ms", "20ms", 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,18 +111,18 @@ func TestHeadAllUnhealthyDegradesByPriority(t *testing.T) {
 		t.Fatalf("status = %d, want 200", code)
 	}
 	if body != "A" {
-		t.Errorf("body = %q, want %q (degraded download should pick highest priority)", body, "A")
+		t.Errorf("body = %q, want %q (degraded download should pick most-preferred)", body, "A")
 	}
 }
 
-// With multiple healthy upstreams, the highest priority one is downloaded.
-func TestRacePicksHighestPriorityHealthy(t *testing.T) {
+// With multiple healthy upstreams, the most-preferred one is downloaded.
+func TestRacePicksMostPreferredHealthy(t *testing.T) {
 	srvA := backend(http.StatusOK, http.StatusOK, "A")
 	defer srvA.Close()
 	srvB := backend(http.StatusOK, http.StatusOK, "B")
 	defer srvB.Close()
 
-	r, err := twoUpstreamRouter(srvA, srvB, 90, 10, strat("200ms", "50ms", 0))
+	r, err := twoUpstreamRouter(srvA, srvB, 1, 2, strat("200ms", "50ms", 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +131,6 @@ func TestRacePicksHighestPriorityHealthy(t *testing.T) {
 		t.Fatalf("status = %d, want 200", code)
 	}
 	if body != "A" {
-		t.Errorf("body = %q, want %q (highest-priority healthy upstream)", body, "A")
+		t.Errorf("body = %q, want %q (most-preferred healthy upstream)", body, "A")
 	}
 }

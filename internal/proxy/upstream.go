@@ -66,7 +66,7 @@ func NewUpstream(cfg *config.Upstream, dlTimeout time.Duration) (*Upstream, erro
 // Name returns the upstream name.
 func (u *Upstream) Name() string { return u.cfg.Name }
 
-// Priority returns the upstream priority (higher = preferred).
+// Priority returns the upstream priority (lower number = preferred).
 func (u *Upstream) Priority() int { return u.priority }
 
 // BaseURL returns the parsed upstream base URL.

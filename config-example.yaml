@@ -19,18 +19,24 @@ strategy:
   download:
     timeout: 0s         # 单上游下载超时（0 = 不限，大包流式推荐）
 
-# 上游列表。priority 数值越大越优先（仅在 HEAD 探测有效/健康时）；
-# 下载时按优先级从高到低尝试，某一个失败则回退到下一个健康上游。
+# 上游列表。priority 数值越小越优先（仅在 HEAD 探测有效/健康时）；
+# 下载时按优先级从小到大尝试，某一个失败则回退到下一个健康上游。
 upstreams:
-  # 上游1：公网 npmmirror，最高优先级。
+  # 上游1：内网镜像（最快，最优先）。固定 IP 解析，绕过 DNS，保留 Host 头与 SNI。
+  - name: intra
+    url: http://npm-registry.zuzuche.net
+    resolve: 10.2.251.99
+    priority: 1
+
+  # 上游2：公网 npmmirror（次优先，快且全）。
   - name: npmmirror
     url: https://registry.npmmirror.com
-    priority: 90
+    priority: 2
 
-  # 上游2：公网官方，需 socks5 代理。身份验证可选（在 URL 中带 user:pass）。
+  # 上游3：公网官方（兜底，需 socks5 代理）。身份验证可选（在 URL 中带 user:pass）。
   - name: npmjs
     url: https://registry.npmjs.org
-    priority: 50
+    priority: 3
     proxy:
       enabled: true
       url: socks5://127.0.0.1:7891
@@ -42,7 +48,7 @@ upstreams:
 # upstreams 省略时使用全部上游；也可用 upstream: <name> 指定单个。
 routes:
   - prefix: /
-    upstreams: [npmmirror, npmjs]
+    upstreams: [intra, npmmirror, npmjs]
     stripPrefix: false
 
 # 更多可选字段（每个 upstream）：

@@ -202,11 +202,12 @@ func (r *Router) raceHeadOnce(parent context.Context, path string, candidates []
 	return healthy
 }
 
-// sortByPriority returns a copy ordered by priority, highest first (stable for ties).
+// sortByPriority returns a copy ordered by priority, lowest first (lower number
+// = preferred; stable for ties).
 func sortByPriority(upstreams []*Upstream) []*Upstream {
 	out := append([]*Upstream(nil), upstreams...)
 	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].Priority() > out[j].Priority()
+		return out[i].Priority() < out[j].Priority()
 	})
 	return out
 }

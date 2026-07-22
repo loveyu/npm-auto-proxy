@@ -21,12 +21,12 @@ For a `GET` request matching a route:
 1. **Race HEADs** against all candidate upstreams concurrently.
 2. Wait up to `strategy.head.firstTimeout` for the **first** success; once one succeeds, wait up to `strategy.head.grace` longer for the rest, then ignore any still pending.
 3. If **no** HEAD succeeds within the window, re-run the race up to `strategy.head.retries` times.
-4. Among the HEAD-healthy upstreams, try downloading in **priority order (highest first)**. If a download fails (network error or HTTP ≥ 400), fall back to the next healthy upstream.
+4. Among the HEAD-healthy upstreams, try downloading in **priority order (lowest number first)**. If a download fails (network error or HTTP ≥ 400), fall back to the next healthy upstream.
 5. If no upstream is healthy after racing, the request degrades to trying all candidates by priority.
 
 Non-`GET` requests skip the race (the body can be consumed only once) and are forwarded to the single highest-priority candidate.
 
-> `priority` is **higher = preferred**. If you want a specific upstream first, give it the largest number.
+> `priority` is **lower number = preferred**. If you want a specific upstream first, give it the smallest number.
 
 ## Quick Start
 
@@ -59,15 +59,15 @@ upstreams:
   - name: intra
     url: http://npm-registry.zuzuche.net
     resolve: 10.2.251.99        # force-dial this IP (keeps Host/SNI)
-    priority: 10
+    priority: 1                 # most preferred (fastest)
 
   - name: npmmirror
     url: https://registry.npmmirror.com
-    priority: 90                 # highest priority
+    priority: 2                 # fast and complete
 
   - name: npmjs
     url: https://registry.npmjs.org
-    priority: 50
+    priority: 3                 # last resort (proxied)
     proxy:
       enabled: true
       url: socks5://127.0.0.1:7891          # or http://127.0.0.1:7891
@@ -85,7 +85,7 @@ routes:
 |-------|-------------|
 | `name` | Unique upstream identifier |
 | `url` | Base registry URL |
-| `priority` | Higher = tried first among HEAD-healthy upstreams |
+| `priority` | Lower number = tried first among HEAD-healthy upstreams |
 | `resolve` | Force-dial this IP for the upstream host (keeps Host/SNI) |
 | `maxIdleConns` / `idleConnsPerHost` | Connection-pool sizing (defaults 100 / 32) |
 | `insecureSkipVerify` | Skip upstream TLS verification (use with caution) |
