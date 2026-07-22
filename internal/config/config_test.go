@@ -75,3 +75,33 @@ func TestLoadValidationErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestRewriteConfigValidation(t *testing.T) {
+	base := "upstreams: [{name: a, url: https://x}]\nroutes: [{prefix: /, upstream: a}]\n"
+	cases := []struct {
+		name string
+		yaml string
+		ok   bool
+	}{
+		{"rewrite off", base, true},
+		{"rewrite on no external", "rewrite: {enabled: true}\n" + base, true},
+		{"rewrite on valid external", "rewrite: {enabled: true, externalUrl: http://127.0.0.1:48180}\n" + base, true},
+		{"rewrite on non-absolute external", "rewrite: {enabled: true, externalUrl: not-a-url}\n" + base, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := writeTempConfig(t, c.yaml)
+			cfg, err := Load(path)
+			if c.ok {
+				if err != nil {
+					t.Fatalf("expected ok, got err: %v", err)
+				}
+				if cfg.RewriteEnabled() != (c.name != "rewrite off") {
+					t.Errorf("RewriteEnabled mismatch")
+				}
+			} else if err == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+		})
+	}
+}

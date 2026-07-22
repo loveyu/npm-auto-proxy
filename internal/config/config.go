@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"time"
@@ -12,10 +13,11 @@ import (
 
 // Config is the root configuration loaded from YAML.
 type Config struct {
-	HTTP      HTTPConfig      `yaml:"http"`
-	Strategy  StrategyConfig  `yaml:"strategy"`
-	Upstreams []Upstream      `yaml:"upstreams"`
-	Routes    []Route         `yaml:"routes"`
+	HTTP      HTTPConfig     `yaml:"http"`
+	Strategy  StrategyConfig `yaml:"strategy"`
+	Rewrite   RewriteConfig  `yaml:"rewrite"`
+	Upstreams []Upstream     `yaml:"upstreams"`
+	Routes    []Route        `yaml:"routes"`
 }
 
 // HTTPConfig configures the listening HTTP server.
@@ -50,9 +52,9 @@ type DownloadConfig struct {
 type Upstream struct {
 	Name               string      `yaml:"name"`
 	URL                string      `yaml:"url"`
-	Priority           int         `yaml:"priority"`           // Lower number = tried first among HEAD-healthy upstreams.
-	Resolve            string      `yaml:"resolve"`            // Force-dial this IP for the upstream host (keeps Host/SNI).
-	Timeout            string      `yaml:"timeout"`            // Reserved (per-upstream tuning, later stages).
+	Priority           int         `yaml:"priority"` // Lower number = tried first among HEAD-healthy upstreams.
+	Resolve            string      `yaml:"resolve"`  // Force-dial this IP for the upstream host (keeps Host/SNI).
+	Timeout            string      `yaml:"timeout"`  // Reserved (per-upstream tuning, later stages).
 	MaxIdleConns       int         `yaml:"maxIdleConns"`
 	IdleConnsPerHost   int         `yaml:"idleConnsPerHost"`
 	InsecureSkipVerify bool        `yaml:"insecureSkipVerify"`
@@ -70,9 +72,22 @@ type ProxyConfig struct {
 // Route maps an incoming path prefix to a set of candidate upstreams that race.
 type Route struct {
 	Prefix      string   `yaml:"prefix"`
-	Upstream    string   `yaml:"upstream"`    // Single candidate (convenience; populates Upstreams if empty).
-	Upstreams   []string `yaml:"upstreams"`   // Candidate names. If empty along with Upstream, all upstreams are used.
+	Upstream    string   `yaml:"upstream"`  // Single candidate (convenience; populates Upstreams if empty).
+	Upstreams   []string `yaml:"upstreams"` // Candidate names. If empty along with Upstream, all upstreams are used.
 	StripPrefix bool     `yaml:"stripPrefix"`
+}
+
+// RewriteConfig controls rewriting dist.tarball URLs inside package metadata
+// responses so downstream caches (e.g. Verdaccio) fetch tarballs through this
+// proxy. Upstream registries publish absolute tarball URLs (e.g.
+// https://registry.example.com/pkg/-/pkg-1.0.0.tgz) that may be unreachable or
+// self-referential behind a reverse proxy; rewriting them to point back at this
+// proxy makes the tarball downloadable via the same path that already routes
+// here. The base URL is derived per request (Host / X-Forwarded-* headers)
+// unless ExternalURL is set.
+type RewriteConfig struct {
+	Enabled     bool   `yaml:"enabled"`     // Master switch (off by default).
+	ExternalURL string `yaml:"externalUrl"` // Optional explicit base, e.g. "http://127.0.0.1:48180". Empty = derive per request.
 }
 
 // Load reads, parses, defaults and validates the configuration file.
@@ -141,6 +156,12 @@ func (c *Config) normalizeRoutes() {
 }
 
 func (c *Config) validate() error {
+	if c.Rewrite.Enabled && c.Rewrite.ExternalURL != "" {
+		u, err := url.Parse(c.Rewrite.ExternalURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("rewrite.externalUrl %q: must be an absolute URL like http://host:port", c.Rewrite.ExternalURL)
+		}
+	}
 	if len(c.Upstreams) == 0 {
 		return fmt.Errorf("no upstreams configured")
 	}
@@ -196,6 +217,12 @@ func (c *Config) UpstreamByName(name string) *Upstream {
 
 // HTTPAddr returns the configured listen address.
 func (c *Config) HTTPAddr() string { return c.HTTP.Addr }
+
+// RewriteEnabled reports whether package metadata tarball URL rewriting is on.
+func (c *Config) RewriteEnabled() bool { return c.Rewrite.Enabled }
+
+// RewriteExternalURL returns the explicit rewrite base URL, or "" to derive per request.
+func (c *Config) RewriteExternalURL() string { return c.Rewrite.ExternalURL }
 
 func (c *Config) ReadTimeoutDur() time.Duration {
 	return parseDurationDefault(c.HTTP.ReadTimeout, 0)

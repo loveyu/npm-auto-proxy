@@ -12,6 +12,7 @@
 - 每上游固定 IP 拨号（保留 Host 头 / TLS SNI）—— 适合内网域名
 - 每上游可选代理：`http://`、`https://`、`socks5://`、`socks5h://`（支持鉴权）
 - 路径前缀路由（最长前缀匹配），可选前缀剥离
+- 可选重写包元数据 `dist.tarball` URL 指向本代理（解决本地镜像 / 反向代理下的 tarball 自指或不可达；重写目标按 `externalUrl` → `X-Forwarded-*` → 请求 `Host` 推断）
 - 优雅关闭，可配置各类服务端超时
 
 ## 工作原理
@@ -77,6 +78,10 @@ routes:
   - prefix: /
     upstreams: [intra, npmmirror, npmjs]     # 参与竞速的候选；省略则用全部上游
     stripPrefix: false
+
+rewrite:
+  enabled: false        # 重写元数据里的 dist.tarball URL 指向本代理（默认关）
+  # externalUrl: http://127.0.0.1:8080      # 显式重写 base；留空则按请求动态推断
 ```
 
 ### Upstream 字段

@@ -1,6 +1,6 @@
 ## 项目概述
 
-npm-auto-proxy 是一个面向 npm registry 的高并发 HTTP 路径转发代理（Go 1.24），设计上放在 Verdaccio 等前置作为上游转发器。对每个请求**并发竞速 HEAD 探测**多个上游，再从**最高优先级的健康上游**下载，下载失败自动回退到下一个。每个上游可单独配置固定 IP 解析与 HTTP/SOCKS5 代理。
+npm-auto-proxy 是一个面向 npm registry 的高并发 HTTP 路径转发代理（Go 1.24），设计上放在 Verdaccio 等前置作为上游转发器。对每个请求**并发竞速 HEAD 探测**多个上游，再从**最高优先级的健康上游**下载，下载失败自动回退到下一个。每个上游可单独配置固定 IP 解析与 HTTP/SOCKS5 代理。可选开启**包元数据 tarball URL 重写**，把上游返回的 `dist.tarball` 绝对 URL 改写为指向本代理，便于下游缓存（如 Verdaccio）经本代理下载 tarball。
 
 ## 常用命令
 
@@ -47,6 +47,14 @@ npm-auto-proxy 是一个面向 npm registry 的高并发 HTTP 路径转发代理
 ### `Upstream.Forward` 的返回约定（fallback 的基石）
 
 `Forward` 返回 `true` 表示响应**已提交**（status < 400）；返回 `false` 表示连接/协议错误或上游 ≥ 400，此时**绝不向 ResponseWriter 写入任何字节**，把回退或 502 的决定权留给 `serve`。任何改动都要保持"false 即零写入"这一不变式，否则回退链会写出脏响应。
+
+### 包元数据 tarball URL 重写（rewrite，`internal/proxy/metadata.go`）
+
+开启 `rewrite.enabled` 后，`Forward` 在响应已确定提交（status < 400）之后，对**包元数据**请求（`GET` 且路径不含 `/-/`，见 `isPackageMetadataPath`）做特殊处理：缓冲整个响应体，解析 JSON，把每个 `versions[].dist.tarball` 与顶层 `dist.tarball` 的 `scheme://host` 替换为本代理地址（保留原 path/query，见 `rewriteTarballURL`）后输出。tarball 下载与其他响应仍走原始流式透传，不受影响。
+
+重写目标 base **按每个请求**动态确定（`rewriteBaseURL`），优先级：配置 `rewrite.externalUrl` > `X-Forwarded-Proto` + `X-Forwarded-Host`（经反向代理） > 请求自身 `Host`；转发头取逗号链最左（原始客户端）值。重写后 body 长度可能变化，故删 `Content-Length` 与失效的 `ETag`，并强制 `Content-Type: application/json`。缓冲上限 `maxMetadataBytes`（64 MB）防异常大响应。读 body 失败仍返回 false（零写入）以保留回退。
+
+> 注意：像 Verdaccio 这类**自身也会重写 tarball URL** 的下游，会基于客户端 Host 覆盖本代理的重写，此时本功能对它无效，需在下游 / 反向代理层另行处理（例如让反代把 tarball 请求直接转给本代理）。
 
 ### 优先级语义
 

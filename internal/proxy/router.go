@@ -41,7 +41,7 @@ func NewRouter(cfg *config.Config) (*Router, error) {
 
 	built := make(map[string]*Upstream, len(cfg.Upstreams))
 	for i := range cfg.Upstreams {
-		u, err := NewUpstream(&cfg.Upstreams[i], dlTimeout)
+		u, err := NewUpstream(&cfg.Upstreams[i], dlTimeout, cfg.RewriteEnabled(), cfg.RewriteExternalURL())
 		if err != nil {
 			return nil, fmt.Errorf("upstream %q: %w", cfg.Upstreams[i].Name, err)
 		}

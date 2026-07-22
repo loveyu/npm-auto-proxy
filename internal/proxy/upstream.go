@@ -30,16 +30,20 @@ var hopByHopHeaders = []string{
 // priority, and dedicated connection-pooled clients (optionally proxied and/or
 // pinned to a fixed IP).
 type Upstream struct {
-	cfg           *config.Upstream
-	base          *url.URL
-	priority      int
-	headClient    *http.Client // does not follow redirects
-	forwardClient *http.Client // follows redirects; Timeout = download timeout
+	cfg             *config.Upstream
+	base            *url.URL
+	priority        int
+	headClient      *http.Client // does not follow redirects
+	forwardClient   *http.Client // follows redirects; Timeout = download timeout
+	rewriteEnabled  bool         // rewrite dist.tarball URLs in metadata responses
+	rewriteExternal string       // explicit rewrite base URL; "" = derive per request
 }
 
 // NewUpstream builds the upstream runtime, including its transport and clients.
 // dlTimeout applies to the forward (download) client; 0 means unlimited.
-func NewUpstream(cfg *config.Upstream, dlTimeout time.Duration) (*Upstream, error) {
+// rewriteEnabled/rewriteExternal control metadata tarball URL rewriting (shared
+// across all upstreams since the rewrite target is this proxy, not the upstream).
+func NewUpstream(cfg *config.Upstream, dlTimeout time.Duration, rewriteEnabled bool, rewriteExternal string) (*Upstream, error) {
 	base, err := url.Parse(cfg.URL)
 	if err != nil {
 		return nil, fmt.Errorf("parse url: %w", err)
@@ -55,11 +59,13 @@ func NewUpstream(cfg *config.Upstream, dlTimeout time.Duration) (*Upstream, erro
 
 	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Upstream{
-		cfg:           cfg,
-		base:          base,
-		priority:      cfg.Priority,
-		headClient:    &http.Client{Transport: tr, CheckRedirect: noRedirect},
-		forwardClient: &http.Client{Transport: tr, Timeout: dlTimeout},
+		cfg:             cfg,
+		base:            base,
+		priority:        cfg.Priority,
+		headClient:      &http.Client{Transport: tr, CheckRedirect: noRedirect},
+		forwardClient:   &http.Client{Transport: tr, Timeout: dlTimeout},
+		rewriteEnabled:  rewriteEnabled,
+		rewriteExternal: rewriteExternal,
 	}, nil
 }
 
@@ -139,10 +145,48 @@ func (u *Upstream) Forward(ctx context.Context, w http.ResponseWriter, inReq *ht
 		return false
 	}
 
+	// Package metadata: buffer and rewrite dist.tarball URLs so downstream
+	// caches fetch tarballs through this proxy. Tarballs and other responses
+	// stream through untouched.
+	if u.rewriteEnabled && inReq.Method == http.MethodGet && isPackageMetadataPath(path) {
+		return u.serveRewrittenMetadata(w, inReq, resp)
+	}
+
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Printf("download [%s %s -> %s]: stream interrupted: %v", inReq.Method, inReq.URL.Path, u.Name(), err)
+	}
+	return true
+}
+
+// serveRewrittenMetadata buffers a metadata response, rewrites its tarball URLs
+// to point back at this proxy, then writes it. Called only after the upstream
+// returned status < 400. If the body is not a metadata document (no parseable
+// tarball URLs), the original bytes pass through unchanged. A read error returns
+// false with zero bytes written so the caller can fall back to another upstream.
+func (u *Upstream) serveRewrittenMetadata(w http.ResponseWriter, inReq *http.Request, resp *http.Response) bool {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadataBytes))
+	resp.Body.Close()
+	if err != nil {
+		log.Printf("download [%s %s -> %s]: read metadata body: %v", inReq.Method, inReq.URL.Path, u.Name(), err)
+		return false
+	}
+	rewritten := rewriteTarballs(body, rewriteBaseURL(inReq, u.rewriteExternal))
+	out := body
+	if rewritten != nil {
+		out = rewritten
+	}
+	h := w.Header()
+	copyHeaders(h, resp.Header)
+	h.Del("Content-Length") // body length may have changed; let Go recompute / chunk
+	if rewritten != nil {
+		h.Del("ETag") // stale ETag no longer matches the rewritten body
+		h.Set("Content-Type", "application/json; charset=utf-8")
+	}
+	w.WriteHeader(resp.StatusCode)
+	if _, err := w.Write(out); err != nil {
+		log.Printf("download [%s %s -> %s]: write metadata body: %v", inReq.Method, inReq.URL.Path, u.Name(), err)
 	}
 	return true
 }
