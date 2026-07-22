@@ -1,0 +1,51 @@
+# npm-auto-proxy 参考配置：多上游优先级竞速下载
+# 复制为 config.yaml 后按需修改。
+
+# HTTP 服务设置。时长支持 Go 单位（ms/s/m/h）；设为 "0s" 表示禁用。
+# Read/Write 超时默认 0（不限），避免大包传输被中途切断；ReadHeaderTimeout 建议保留。
+http:
+  addr: ":8080"            # 监听地址
+  readHeaderTimeout: 10s   # 读取请求头的最长时间（防慢速攻击）
+  readTimeout: 0s          # 读取完整请求的最长时间（0 = 不限）
+  writeTimeout: 0s         # 写响应的最长时间（0 = 不限，流式推荐）
+  idleTimeout: 120s        # keep-alive 空闲超时
+
+# 竞速与下载策略
+strategy:
+  head:
+    firstTimeout: 30s   # 等待「首个」HEAD 成功的最长时间；全部超时则进入重试
+    grace: 5s           # 首个 HEAD 成功后，继续等待其余上游的宽限期；超时则忽略未到的
+    retries: 2          # 整轮 HEAD 全部超时后的重试次数（总尝试 = retries + 1，默认共 3 次）
+  download:
+    timeout: 0s         # 单上游下载超时（0 = 不限，大包流式推荐）
+
+# 上游列表。priority 数值越大越优先（仅在 HEAD 探测有效/健康时）；
+# 下载时按优先级从高到低尝试，某一个失败则回退到下一个健康上游。
+upstreams:
+  # 上游1：公网 npmmirror，最高优先级。
+  - name: npmmirror
+    url: https://registry.npmmirror.com
+    priority: 90
+
+  # 上游2：公网官方，需 socks5 代理。身份验证可选（在 URL 中带 user:pass）。
+  - name: npmjs
+    url: https://registry.npmjs.org
+    priority: 50
+    proxy:
+      enabled: true
+      url: socks5://127.0.0.1:7891
+      # 带身份验证： socks5://user:pass@127.0.0.1:7891
+      # HTTP 代理：   http://user:pass@127.0.0.1:7891
+      # （HTTP 代理的鉴权由标准库自动处理 Proxy-Authorization）
+
+# 路径前缀 -> 候选上游组。匹配按最长前缀优先（自动排序），"/" 兜底放任意位置。
+# upstreams 省略时使用全部上游；也可用 upstream: <name> 指定单个。
+routes:
+  - prefix: /
+    upstreams: [npmmirror, npmjs]
+    stripPrefix: false
+
+# 更多可选字段（每个 upstream）：
+#   maxIdleConns / idleConnsPerHost  : 连接池大小（默认 100 / 32）
+#   insecureSkipVerify               : 跳过上游 TLS 校验（谨慎使用）
+#   timeout                          : 预留，后续阶段每上游调优

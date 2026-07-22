@@ -24,9 +24,14 @@ profile.cov
 go.work
 go.work.sum
 
+# Build output
+npm-auto-proxy
+
 # env file
 .env
+config.yaml
 
 # Editor/IDE
-# .idea/
+.idea/
+.claude/
 # .vscode/
