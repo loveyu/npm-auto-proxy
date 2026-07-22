@@ -54,7 +54,7 @@ func runStart() {
 	log.Printf("npm-auto-proxy %s starting...", version)
 	log.Printf("config: %s", cfgPath)
 	if debug {
-		log.Printf("debug logging enabled")
+		log.Printf("debug logging enabled (per-request logs on)")
 	}
 
 	cfg, err := config.Load(cfgPath)

@@ -20,6 +20,13 @@ type Router struct {
 	headFirst   time.Duration // max wait for the first HEAD success
 	headGrace   time.Duration // extra wait after the first success
 	headRetries int           // re-run the whole race if every probe times out
+	debug       bool          // emit per-request debug logs
+}
+
+// requestInfo carries per-request tracing data (the upstream that served the
+// request, or a failure hint) so ServeHTTP can emit a single completion line.
+type requestInfo struct {
+	upstream string
 }
 
 type compiledRoute struct {
@@ -62,6 +69,7 @@ func NewRouter(cfg *config.Config) (*Router, error) {
 		headFirst:   cfg.HeadFirstTimeoutDur(),
 		headGrace:   cfg.HeadGraceDur(),
 		headRetries: cfg.HeadRetries(),
+		debug:       config.IsDebug(),
 	}, nil
 }
 
@@ -83,25 +91,33 @@ func (r *Router) Upstreams() []*Upstream {
 
 // ServeHTTP dispatches the request to the first matching route's strategy.
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
 	for _, cr := range r.routes {
 		if strings.HasPrefix(req.URL.Path, cr.prefix) {
-			cr.serve(w, req, r)
+			r.debugf(">> %s %s: route %q (candidates=%v, stripPrefix=%v)",
+				req.Method, req.URL.Path, cr.prefix, upstreamNames(cr.upstreams), cr.stripPrefix)
+			info := &requestInfo{}
+			cr.serve(w, req, r, info)
+			r.debugf("<< %s %s: %s in %s", req.Method, req.URL.Path, info.upstream, time.Since(start))
 			return
 		}
 	}
+	r.debugf(">> %s %s: no matching route -> 404", req.Method, req.URL.Path)
 	http.NotFound(w, req)
 }
 
 // serve applies the racing/fallback strategy for this route.
-func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Router) {
+func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Router, info *requestInfo) {
 	path := cr.strip(req.URL.Path)
 	candidates := cr.upstreams
 
 	// Single candidate: no race needed.
 	if len(candidates) == 1 {
 		if candidates[0].Forward(req.Context(), w, req, path) {
+			info.upstream = "served by " + candidates[0].Name()
 			return
 		}
+		info.upstream = "502 upstream " + candidates[0].Name() + " unreachable"
 		http.Error(w, "upstream unreachable", http.StatusBadGateway)
 		return
 	}
@@ -110,14 +126,18 @@ func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Rout
 	// tried in priority order; a download failure falls back to the next.
 	if req.Method == http.MethodGet {
 		alive := r.raceHead(req, cr)
+		r.debugf("   %s %s: head race healthy=%v", req.Method, req.URL.Path, upstreamNames(alive))
 		if len(alive) == 0 {
 			alive = sortByPriority(candidates) // race fully failed: best-effort by priority
 		}
 		for _, u := range alive {
 			if u.Forward(req.Context(), w, req, path) {
+				info.upstream = "served by " + u.Name()
 				return
 			}
+			r.debugf("   %s %s: upstream %q failed, falling back", req.Method, req.URL.Path, u.Name())
 		}
+		info.upstream = "502 all upstreams failed"
 		http.Error(w, "all upstreams failed", http.StatusBadGateway)
 		return
 	}
@@ -125,9 +145,12 @@ func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Rout
 	// Non-GET: the request body can be consumed only once, so try just the
 	// highest-priority candidate without racing or fallback.
 	ordered := sortByPriority(candidates)
-	if !ordered[0].Forward(req.Context(), w, req, path) {
-		http.Error(w, "upstream failed", http.StatusBadGateway)
+	if ordered[0].Forward(req.Context(), w, req, path) {
+		info.upstream = "served by " + ordered[0].Name()
+		return
 	}
+	info.upstream = "502 upstream " + ordered[0].Name() + " failed"
+	http.Error(w, "upstream failed", http.StatusBadGateway)
 }
 
 func (cr *compiledRoute) strip(path string) string {
@@ -172,6 +195,11 @@ func (r *Router) raceHeadOnce(parent context.Context, path string, candidates []
 	for _, u := range candidates {
 		go func(u *Upstream) {
 			status, err := u.Head(ctx, path)
+			if err != nil {
+				r.debugf("   head %s %s: %v", path, u.Name(), err)
+			} else {
+				r.debugf("   head %s %s: HTTP %d", path, u.Name(), status)
+			}
 			ch <- headResult{u, status, err}
 		}(u)
 	}
@@ -235,4 +263,20 @@ func collectHealthy(ch <-chan headResult, healthy *[]*Upstream) {
 			return
 		}
 	}
+}
+
+// debugf emits a [debug]-prefixed log line only when debug mode is enabled.
+func (r *Router) debugf(format string, args ...any) {
+	if r.debug {
+		log.Printf("[debug] "+format, args...)
+	}
+}
+
+// upstreamNames returns the names of the given upstreams, in order.
+func upstreamNames(us []*Upstream) []string {
+	names := make([]string, len(us))
+	for i, u := range us {
+		names[i] = u.Name()
+	}
+	return names
 }
