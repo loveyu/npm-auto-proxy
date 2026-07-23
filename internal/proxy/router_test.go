@@ -3,6 +3,7 @@ package proxy
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"npm-auto-proxy/internal/config"
@@ -78,5 +79,69 @@ func TestNewRouterBadProxyScheme(t *testing.T) {
 	}
 	if _, err := NewRouter(cfg); err == nil {
 		t.Fatal("expected error for unsupported proxy scheme, got nil")
+	}
+}
+
+// TestGetRelaysDefinitive4xxWhenAllUpstreamsFail covers the npm attestations
+// case: a package version with no provenance gets a unanimous 404 from every
+// upstream. That is a definitive answer the client must see as 404, not a
+// gateway 502 (which npm/pnpm treat as a hard install error).
+func TestGetRelaysDefinitive4xxWhenAllUpstreamsFail(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"File not found"}`))
+	}))
+	defer backend.Close()
+
+	cfg := &config.Config{
+		Upstreams: []config.Upstream{
+			{Name: "a", URL: backend.URL, Priority: 1},
+			{Name: "b", URL: backend.URL, Priority: 2},
+		},
+		Routes: []config.Route{{Prefix: "/", Upstreams: []string{"a", "b"}}},
+	}
+	r, err := NewRouter(cfg)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/-/npm/v1/attestations/@scope/pkg@1.0.0", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want relayed 404; body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "File not found") {
+		t.Errorf("body = %q, want the relayed upstream body", rec.Body.String())
+	}
+}
+
+// TestGetReturns502OnlyForTransportErrors ensures a synthetic 502 is still used
+// when every candidate is genuinely unreachable (no definitive status at all),
+// so the 404-relay path doesn't mask real outages.
+func TestGetReturns502OnlyForTransportErrors(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	dead.Close() // port now refuses connections -> transport error, status 0
+
+	cfg := &config.Config{
+		Upstreams: []config.Upstream{
+			{Name: "a", URL: dead.URL, Priority: 1},
+			{Name: "b", URL: dead.URL, Priority: 2},
+		},
+		Routes: []config.Route{{Prefix: "/", Upstreams: []string{"a", "b"}}},
+	}
+	r, err := NewRouter(cfg)
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/-/npm/v1/attestations/x@1.0.0", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 for all-unreachable upstreams", rec.Code)
 	}
 }

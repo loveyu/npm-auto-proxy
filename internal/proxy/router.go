@@ -166,7 +166,8 @@ func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Rout
 
 	// Single candidate: no race needed.
 	if len(candidates) == 1 {
-		if candidates[0].Forward(req.Context(), ww, req, path) {
+		committed, status := candidates[0].Forward(req.Context(), ww, req, path)
+		if committed {
 			if finalize != nil {
 				finalize(true)
 			}
@@ -175,6 +176,14 @@ func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Rout
 		}
 		if finalize != nil {
 			finalize(false)
+		}
+		// No body to re-send on non-GET, so only a GET can relay a definitive
+		// upstream answer (e.g. 404) instead of a synthetic 502.
+		if status >= 400 && req.Method == http.MethodGet {
+			if relayed := candidates[0].Relay(req.Context(), w, req, path); relayed > 0 {
+				info.upstream = fmt.Sprintf("relayed %d from %s", relayed, candidates[0].Name())
+				return
+			}
 		}
 		info.upstream = "502 upstream " + candidates[0].Name() + " unreachable"
 		http.Error(w, "upstream unreachable", http.StatusBadGateway)
@@ -189,18 +198,33 @@ func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Rout
 		if len(alive) == 0 {
 			alive = sortByPriority(candidates) // race fully failed: best-effort by priority
 		}
+		// Remember the highest-priority candidate that returned a definitive HTTP
+		// status (alive is priority-sorted). If nobody commits a 2xx/3xx, relaying
+		// its real status (e.g. 404) beats a synthetic 502 — every reachable
+		// upstream agreeing on "not found" is an answer, not a gateway failure.
+		var bestDefinitive *Upstream
 		for _, u := range alive {
-			if u.Forward(req.Context(), ww, req, path) {
+			committed, status := u.Forward(req.Context(), ww, req, path)
+			if committed {
 				if finalize != nil {
 					finalize(true)
 				}
 				info.upstream = "served by " + u.Name()
 				return
 			}
-			r.debugf("   %s %s: upstream %q failed, falling back", req.Method, req.URL.Path, u.Name())
+			if status >= 400 && bestDefinitive == nil {
+				bestDefinitive = u
+			}
+			r.debugf("   %s %s: upstream %q failed (status %d), falling back", req.Method, req.URL.Path, u.Name(), status)
 		}
 		if finalize != nil {
 			finalize(false)
+		}
+		if bestDefinitive != nil {
+			if relayed := bestDefinitive.Relay(req.Context(), w, req, path); relayed > 0 {
+				info.upstream = fmt.Sprintf("relayed %d from %s", relayed, bestDefinitive.Name())
+				return
+			}
 		}
 		info.upstream = "502 all upstreams failed"
 		http.Error(w, "all upstreams failed", http.StatusBadGateway)
@@ -208,9 +232,12 @@ func (cr *compiledRoute) serve(w http.ResponseWriter, req *http.Request, r *Rout
 	}
 
 	// Non-GET: the request body can be consumed only once, so try just the
-	// highest-priority candidate without racing or fallback.
+	// highest-priority candidate without racing or fallback. A definitive 4xx/5xx
+	// cannot be relayed either (re-sending would need the body again), so a
+	// non-2xx answer surfaces as 502 here.
 	ordered := sortByPriority(candidates)
-	if ordered[0].Forward(req.Context(), ww, req, path) {
+	committed, _ := ordered[0].Forward(req.Context(), ww, req, path)
+	if committed {
 		if finalize != nil {
 			finalize(true)
 		}

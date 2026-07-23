@@ -46,7 +46,16 @@ npm-auto-proxy 是一个面向 npm registry 的高并发 HTTP 路径转发代理
 
 ### `Upstream.Forward` 的返回约定（fallback 的基石）
 
-`Forward` 返回 `true` 表示响应**已提交**（status < 400）；返回 `false` 表示连接/协议错误或上游 ≥ 400，此时**绝不向 ResponseWriter 写入任何字节**，把回退或 502 的决定权留给 `serve`。任何改动都要保持"false 即零写入"这一不变式，否则回退链会写出脏响应。
+`Forward` 返回 `(committed bool, status int)`：
+- `committed=true, status<400`：成功响应**已写入** w。
+- `committed=false, status==0`：连接/协议错误，**零写入**，调用方应回退下一个上游。
+- `committed=false, status>=400`：上游给了**确定的 HTTP 应答**（如 404），**零写入**，调用方可继续回退（镜像上可能有），但若所有候选都确定应答，应透传该 status（见下），而非合成 502。
+
+"committed=false ⟹ 零写入"这一不变式必须保持，否则回退链会写出脏响应。
+
+### 确定应答透传（`Upstream.Relay`，避免 404→502）
+
+当 GET 的所有候选都没能提交 2xx/3xx、但**至少一个**给出了确定 status（≥400，如 npm provenance attestations 端点对无证明的包返回 404）时，`serve` 用最高优先级那个候选的 `Relay` **原样透传**（status/headers/body）真实应答，而非合成 502。`Relay` 直接写原始 `w`（不经缓存 tee、不做元数据重写），故错误响应永不缓存。只有**全部传输错误**（status 全为 0，上游真不可达）时才回退到 502。**非 GET 无法透传**（body 只能消费一次，重发需要再次发送 body），故非 GET 的非 2xx 仍为 502。
 
 ### 包元数据 tarball URL 重写（rewrite，`internal/proxy/metadata.go`）
 

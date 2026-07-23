@@ -120,10 +120,18 @@ func (u *Upstream) Head(ctx context.Context, path string) (int, error) {
 }
 
 // Forward streams the request body to the upstream and the upstream response to
-// the client. It returns true once the response has been committed (status <
-// 400). A connection/protocol error or a >= 400 status returns false without
-// writing anything, letting the caller fall back to another upstream.
-func (u *Upstream) Forward(ctx context.Context, w http.ResponseWriter, inReq *http.Request, path string) bool {
+// the client. It returns (committed, status):
+//   - committed=true, status<400: a successful response was written to w.
+//   - committed=false, status==0: a connection/protocol error occurred and
+//     nothing was written; the caller should fall back to another upstream.
+//   - committed=false, status>=400: the upstream returned a definitive HTTP
+//     status and nothing was written; the caller may still fall back (a mirror
+//     might have the resource), but if every candidate is also definitive it
+//     should relay this status via Relay rather than synthesize a 502.
+//
+// The "committed=false ⟹ zero bytes written" invariant is preserved so the
+// fallback chain never emits a partial response.
+func (u *Upstream) Forward(ctx context.Context, w http.ResponseWriter, inReq *http.Request, path string) (committed bool, status int) {
 	outReq := inReq.Clone(ctx)
 	outReq.URL.Scheme = u.base.Scheme
 	outReq.URL.Host = u.base.Host
@@ -147,20 +155,23 @@ func (u *Upstream) Forward(ctx context.Context, w http.ResponseWriter, inReq *ht
 	resp, err := u.forwardClient.Do(outReq)
 	if err != nil {
 		log.Printf("download [%s %s -> %s]: %v", inReq.Method, inReq.URL.Path, u.Name(), err)
-		return false
+		return false, 0
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		log.Printf("download [%s %s -> %s]: upstream returned HTTP %d", inReq.Method, inReq.URL.Path, u.Name(), resp.StatusCode)
-		return false
+		return false, resp.StatusCode
 	}
 
 	// Package metadata: buffer and rewrite dist.tarball URLs so downstream
 	// caches fetch tarballs through this proxy. Tarballs and other responses
 	// stream through untouched.
 	if rewriteMetadata {
-		return u.serveRewrittenMetadata(w, inReq, resp)
+		if u.serveRewrittenMetadata(w, inReq, resp) {
+			return true, resp.StatusCode
+		}
+		return false, 0
 	}
 
 	copyHeaders(w.Header(), resp.Header)
@@ -168,7 +179,41 @@ func (u *Upstream) Forward(ctx context.Context, w http.ResponseWriter, inReq *ht
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Printf("download [%s %s -> %s]: stream interrupted: %v", inReq.Method, inReq.URL.Path, u.Name(), err)
 	}
-	return true
+	return true, resp.StatusCode
+}
+
+// Relay fetches the resource from the upstream and streams the response to w
+// verbatim — status code, headers, and body — regardless of the status code. It
+// is the terminal fallback used when no candidate committed a successful
+// (2xx/3xx) response but at least one returned a definitive HTTP status:
+// relaying the real 4xx/5xx (e.g. a 404 "no attestations") is more useful to the
+// client than a synthetic 502. It writes to the original ResponseWriter (not the
+// cache tee) so error responses are never cached, and performs no metadata
+// rewriting (definitive non-2xx answers are never package metadata). Returns the
+// status code written, or 0 on a transport error (nothing written, letting the
+// caller fall back to 502).
+func (u *Upstream) Relay(ctx context.Context, w http.ResponseWriter, inReq *http.Request, path string) int {
+	outReq := inReq.Clone(ctx)
+	outReq.URL.Scheme = u.base.Scheme
+	outReq.URL.Host = u.base.Host
+	outReq.Host = u.base.Host
+	outReq.URL.Path = joinPath(u.base.Path, path)
+	outReq.URL.RawPath = ""
+	outReq.RequestURI = ""
+	dropHopByHop(outReq.Header)
+
+	resp, err := u.forwardClient.Do(outReq)
+	if err != nil {
+		log.Printf("relay [%s %s -> %s]: %v", inReq.Method, inReq.URL.Path, u.Name(), err)
+		return 0
+	}
+	defer resp.Body.Close()
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("relay [%s %s -> %s]: stream interrupted: %v", inReq.Method, inReq.URL.Path, u.Name(), err)
+	}
+	return resp.StatusCode
 }
 
 // serveRewrittenMetadata buffers a metadata response, rewrites its tarball URLs
