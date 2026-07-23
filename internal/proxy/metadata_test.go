@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -180,12 +181,119 @@ func TestForwardRewritesMetadataTarballURL(t *testing.T) {
 	if want := "http://127.0.0.1:48180/pkg/-/pkg-1.0.0.tgz"; tb != want {
 		t.Errorf("tarball = %q, want %q", tb, want)
 	}
-	// Stale Content-Length / ETag must be dropped (they no longer match).
-	if rec.Header().Get("ETag") != "" {
-		t.Errorf("ETag should be dropped, got %q", rec.Header().Get("ETag"))
+	// Content-Length must be dropped (rewritten body length differs), but the
+	// upstream ETag is preserved so downstream clients can issue conditional
+	// requests and get 304s instead of re-downloading the manifest.
+	if rec.Header().Get("ETag") != `"abc"` {
+		t.Errorf("ETag should be preserved for 304 support, got %q", rec.Header().Get("ETag"))
 	}
 	if rec.Header().Get("Content-Length") != "" {
 		t.Errorf("Content-Length should be dropped, got %q", rec.Header().Get("Content-Length"))
+	}
+}
+
+// TestForwardRewritesGzippedMetadata is the regression test for the bug where
+// clients (Verdaccio/npm) send Accept-Encoding: gzip and the upstream returns a
+// gzipped manifest: the proxy must still rewrite tarball URLs. Without stripping
+// the client's Accept-Encoding, the body arrives still-gzipped, json.Unmarshal
+// fails, and the original upstream bytes (unrewritten) pass straight through.
+func TestForwardRewritesGzippedMetadata(t *testing.T) {
+	manifest := `{"name":"pkg","versions":{"1.0.0":{"dist":{"tarball":"https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"}}}}`
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		gz.Write([]byte(manifest))
+		gz.Close()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("ETag", `"abc"`)
+		w.Write(buf.Bytes())
+	}))
+	defer backend.Close()
+
+	r := newRewriteRouter(t, backend.URL, true, "")
+
+	req := httptest.NewRequest(http.MethodGet, "/pkg", nil)
+	req.Host = "127.0.0.1:48180"
+	req.Header.Set("Accept-Encoding", "gzip") // exactly what Verdaccio/npm send
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	// The response must be decompressed plain JSON (the proxy stripped the
+	// client's Accept-Encoding so Go's transport auto-decompressed).
+	if ce := rec.Header().Get("Content-Encoding"); ce != "" {
+		t.Errorf("Content-Encoding should be removed, got %q", ce)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("response not decompressed JSON: %v body=%q", err, rec.Body.String())
+	}
+	tb := doc["versions"].(map[string]any)["1.0.0"].(map[string]any)["dist"].(map[string]any)["tarball"].(string)
+	if want := "http://127.0.0.1:48180/pkg/-/pkg-1.0.0.tgz"; tb != want {
+		t.Errorf("tarball = %q, want %q (gzipped metadata not rewritten)", tb, want)
+	}
+}
+
+// TestForwardMetadataConditional304 verifies that metadata responses support
+// conditional requests: the first GET returns a rewritten body with the upstream
+// ETag preserved, and a follow-up If-None-Match is forwarded so the upstream can
+// answer 304, which the proxy passes through with no body.
+func TestForwardMetadataConditional304(t *testing.T) {
+	manifest := `{"name":"pkg","versions":{"1.0.0":{"dist":{"tarball":"https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"}}}}`
+	sawIfNoneMatch := make(chan string, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if inm := r.Header.Get("If-None-Match"); inm != "" {
+			sawIfNoneMatch <- inm
+			w.Header().Set("ETag", `"abc"`)
+			w.WriteHeader(http.StatusNotModified) // upstream says: client's copy is fresh
+			return
+		}
+		w.Header().Set("ETag", `"abc"`)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		io.WriteString(w, manifest)
+	}))
+	defer backend.Close()
+
+	r := newRewriteRouter(t, backend.URL, true, "")
+
+	// First fetch: rewritten body, ETag preserved so the client can cache it.
+	req1 := httptest.NewRequest(http.MethodGet, "/pkg", nil)
+	req1.Host = "127.0.0.1:48180"
+	rec1 := httptest.NewRecorder()
+	r.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first fetch status = %d, want 200", rec1.Code)
+	}
+	if rec1.Header().Get("ETag") != `"abc"` {
+		t.Fatalf("ETag not preserved on rewritten 200: got %q", rec1.Header().Get("ETag"))
+	}
+
+	// Second fetch with If-None-Match: proxy forwards it, upstream returns 304,
+	// proxy forwards the 304 with ETag and an empty body.
+	req2 := httptest.NewRequest(http.MethodGet, "/pkg", nil)
+	req2.Host = "127.0.0.1:48180"
+	req2.Header.Set("If-None-Match", `"abc"`)
+	rec2 := httptest.NewRecorder()
+	r.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusNotModified {
+		t.Fatalf("conditional fetch status = %d, want 304", rec2.Code)
+	}
+	if rec2.Header().Get("ETag") != `"abc"` {
+		t.Errorf("304 missing ETag: got %q", rec2.Header().Get("ETag"))
+	}
+	if rec2.Body.Len() != 0 {
+		t.Errorf("304 should have an empty body, got %d bytes %q", rec2.Body.Len(), rec2.Body.String())
+	}
+	select {
+	case v := <-sawIfNoneMatch:
+		if v != `"abc"` {
+			t.Errorf("If-None-Match forwarded as %q, want %q", v, `"abc"`)
+		}
+	default:
+		t.Error("If-None-Match was not forwarded to the upstream")
 	}
 }
 

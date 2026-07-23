@@ -54,7 +54,7 @@ routes:
 # 包元数据 tarball URL 重写。上游 registry 返回的 dist.tarball 是绝对 URL
 # （如 https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz），在反向代理 / 本地镜像
 # 场景下可能不可达或自指。开启后，元数据 JSON 里的 tarball URL 会被重写为
-# 指向本代理，使下游缓存（如 Verdaccio）经由本代理下载 tarball。
+# 指向本代理，使下游经由本代理下载 tarball。
 # 重写 base 按优先级确定：externalUrl > X-Forwarded-Proto/Host > 请求 Host。
 rewrite:
   enabled: false        # 总开关（默认关，不影响现有行为）

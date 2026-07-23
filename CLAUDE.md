@@ -1,6 +1,6 @@
 ## 项目概述
 
-npm-auto-proxy 是一个面向 npm registry 的高并发 HTTP 路径转发代理（Go 1.24），设计上放在 Verdaccio 等前置作为上游转发器。对每个请求**并发竞速 HEAD 探测**多个上游，再从**最高优先级的健康上游**下载，下载失败自动回退到下一个。每个上游可单独配置固定 IP 解析与 HTTP/SOCKS5 代理。可选开启**包元数据 tarball URL 重写**，把上游返回的 `dist.tarball` 绝对 URL 改写为指向本代理，便于下游缓存（如 Verdaccio）经本代理下载 tarball。
+npm-auto-proxy 是一个面向 npm registry 的高并发 HTTP 路径转发代理（Go 1.24）。对每个请求**并发竞速 HEAD 探测**多个上游，再从**最高优先级的健康上游**下载，下载失败自动回退到下一个。每个上游可单独配置固定 IP 解析与 HTTP/SOCKS5 代理。可选开启**包元数据 tarball URL 重写**，把上游返回的 `dist.tarball` 绝对 URL 改写为指向本代理，便于下游经本代理下载 tarball。
 
 ## 常用命令
 
@@ -52,10 +52,9 @@ npm-auto-proxy 是一个面向 npm registry 的高并发 HTTP 路径转发代理
 
 开启 `rewrite.enabled` 后，`Forward` 在响应已确定提交（status < 400）之后，对**包元数据**请求（`GET` 且路径不含 `/-/`，见 `isPackageMetadataPath`）做特殊处理：缓冲整个响应体，解析 JSON，把每个 `versions[].dist.tarball` 与顶层 `dist.tarball` 的 `scheme://host` 替换为本代理地址（保留原 path/query，见 `rewriteTarballURL`）后输出。tarball 下载与其他响应仍走原始流式透传，不受影响。
 
-重写目标 base **按每个请求**动态确定（`rewriteBaseURL`），优先级：配置 `rewrite.externalUrl` > `X-Forwarded-Proto` + `X-Forwarded-Host`（经反向代理） > 请求自身 `Host`；转发头取逗号链最左（原始客户端）值。重写后 body 长度可能变化，故删 `Content-Length` 与失效的 `ETag`，并强制 `Content-Type: application/json`。缓冲上限 `maxMetadataBytes`（64 MB）防异常大响应。读 body 失败仍返回 false（零写入）以保留回退。
+**gzip 处理**：下游（Verdaccio/npm）会带 `Accept-Encoding: gzip`，若原样转发，上游返回的 gzip 元数据无法被 `json.Unmarshal` 解析、tarball 不会被重写（直接透传未重写的上游字节）。故元数据 GET 在**出站前剥离 `Accept-Encoding`**，由 Go transport 自行加 gzip 并透明解压，保证 `resp.Body` 恒为明文 JSON。仅对元数据路径生效，tarball 下载仍保留客户端的编码。
 
-> 注意：像 Verdaccio 这类**自身也会重写 tarball URL** 的下游，会基于客户端 Host 覆盖本代理的重写，此时本功能对它无效，需在下游 / 反向代理层另行处理（例如让反代把 tarball 请求直接转给本代理）。
-
+重写目标 base **按每个请求**动态确定（`rewriteBaseURL`），优先级：配置 `rewrite.externalUrl` > `X-Forwarded-Proto` + `X-Forwarded-Host`（经反向代理） > 请求自身 `Host`；转发头取逗号链最左（原始客户端）值。重写后 body 长度可能变化，故删 `Content-Length` 并强制 `Content-Type: application/json`。**保留**上游 `ETag`/`Last-Modified`：重写是上游 body 的确定性函数，上游文档不变 ⟹ 重写后 body 不变，故上游校验器对重写字节仍有效。转发客户端的 `If-None-Match`/`If-Modified-Since`，上游回 304 时 `serveRewrittenMetadata` 直接透传 304（带 ETag、空 body），下游复用本地缓存、避免重复拉取整份元数据。缓冲上限 `maxMetadataBytes`（64 MB）防异常大响应。读 body 失败仍返回 false（零写入）以保留回退。
 ### tarball 磁盘缓存（cache，`internal/cache/`）
 
 可选功能，配置 `cache.directories`（数组，每项 `{path, type}`，`type` ∈ `read`（默认）/`write`，**最多一个 `write`**）即开启。**仅缓存压缩包**——`isCachablePath` 判定路径以 `.tgz`/`.tar.gz`/`.zip`/`.gz`/... 结尾；包元数据路径无此后缀，天然不缓存。缓存**永久**（无 TTL / 无淘汰 / 无容量上限）。缓存键即**请求路径**（`cacheRelPath`：剥前导 `/`、拒绝 `..` 防穿越；带查询串时追加短哈希避免碰撞），例如 `/@scope/pkg/-/pkg-1.0.0.tgz` → `<writeDir>/@scope/pkg/-/pkg-1.0.0.tgz`。**不**兼容 pnpm 的 content-addressable store（pnpm 存的是解压后的单文件 blob，无整包 tarball 可读），缓存目录是本代理自管的目录。
@@ -70,7 +69,7 @@ npm-auto-proxy 是一个面向 npm registry 的高并发 HTTP 路径转发代理
 
 ### 优先级语义
 
-`priority` **数值越小越优先**（commit `1a273ed` 刚把语义从"大=优先"翻转过来，改代码时不要看旧直觉）。`sortByPriority` 做升序稳定排序，下载顺序与健康列表排序都依赖它。
+`priority` **数值越小越优先**。`sortByPriority` 做升序稳定排序，下载顺序与健康列表排序都依赖它。
 
 ### 每上游独立运行时（`internal/proxy/upstream.go`）
 

@@ -133,6 +133,17 @@ func (u *Upstream) Forward(ctx context.Context, w http.ResponseWriter, inReq *ht
 	outReq.RequestURI = ""
 	dropHopByHop(outReq.Header)
 
+	// Metadata responses are buffered and have their dist.tarball URLs rewritten,
+	// which only works on a decoded (non-gzip) body. Strip the client's
+	// Accept-Encoding so Go's transport adds its own gzip and transparently
+	// decompresses; otherwise a gzipped manifest would be passed through with
+	// unrewritten tarballs pointing at the upstream. Only for the metadata path —
+	// tarballs stream through untouched and keep the client's encoding.
+	rewriteMetadata := u.rewriteEnabled && inReq.Method == http.MethodGet && isPackageMetadataPath(path)
+	if rewriteMetadata {
+		outReq.Header.Del("Accept-Encoding")
+	}
+
 	resp, err := u.forwardClient.Do(outReq)
 	if err != nil {
 		log.Printf("download [%s %s -> %s]: %v", inReq.Method, inReq.URL.Path, u.Name(), err)
@@ -148,7 +159,7 @@ func (u *Upstream) Forward(ctx context.Context, w http.ResponseWriter, inReq *ht
 	// Package metadata: buffer and rewrite dist.tarball URLs so downstream
 	// caches fetch tarballs through this proxy. Tarballs and other responses
 	// stream through untouched.
-	if u.rewriteEnabled && inReq.Method == http.MethodGet && isPackageMetadataPath(path) {
+	if rewriteMetadata {
 		return u.serveRewrittenMetadata(w, inReq, resp)
 	}
 
@@ -162,10 +173,28 @@ func (u *Upstream) Forward(ctx context.Context, w http.ResponseWriter, inReq *ht
 
 // serveRewrittenMetadata buffers a metadata response, rewrites its tarball URLs
 // to point back at this proxy, then writes it. Called only after the upstream
-// returned status < 400. If the body is not a metadata document (no parseable
-// tarball URLs), the original bytes pass through unchanged. A read error returns
-// false with zero bytes written so the caller can fall back to another upstream.
+// returned status < 400. Conditional requests are honored: a 304 from the
+// upstream is forwarded with its validator headers and no body so downstream
+// clients (Verdaccio) reuse their cached manifest instead of re-downloading it.
+// On a 200 the upstream's ETag/Last-Modified are preserved — rewriting is
+// deterministic, so the upstream validators remain valid for the rewritten
+// bytes and later If-None-Match requests yield 304s. If the body is not a
+// metadata document (no parseable tarball URLs), the original bytes pass through
+// unchanged. A read error returns false with zero bytes written so the caller
+// can fall back to another upstream.
 func (u *Upstream) serveRewrittenMetadata(w http.ResponseWriter, inReq *http.Request, resp *http.Response) bool {
+	// 304 Not Modified: the client's cached copy is still current (its
+	// If-None-Match/If-Modified-Since matched the upstream). Forward the status
+	// with the validator headers and no body so the downstream client reuses its
+	// cache rather than re-fetching the manifest.
+	if resp.StatusCode == http.StatusNotModified {
+		h := w.Header()
+		copyHeaders(h, resp.Header)
+		h.Del("Content-Length")
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMetadataBytes))
 	resp.Body.Close()
 	if err != nil {
@@ -181,7 +210,11 @@ func (u *Upstream) serveRewrittenMetadata(w http.ResponseWriter, inReq *http.Req
 	copyHeaders(h, resp.Header)
 	h.Del("Content-Length") // body length may have changed; let Go recompute / chunk
 	if rewritten != nil {
-		h.Del("ETag") // stale ETag no longer matches the rewritten body
+		// Keep the upstream ETag/Last-Modified (already copied above) so
+		// downstream clients can make conditional requests and get 304s.
+		// Rewriting is a deterministic function of the upstream body, so an
+		// unchanged upstream document maps to an unchanged rewritten body and
+		// the upstream validators stay valid for the rewritten bytes.
 		h.Set("Content-Type", "application/json; charset=utf-8")
 	}
 	w.WriteHeader(resp.StatusCode)

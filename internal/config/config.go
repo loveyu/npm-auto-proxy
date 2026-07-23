@@ -81,7 +81,7 @@ type Route struct {
 }
 
 // RewriteConfig controls rewriting dist.tarball URLs inside package metadata
-// responses so downstream caches (e.g. Verdaccio) fetch tarballs through this
+// responses so downstream consumers fetch tarballs through this
 // proxy. Upstream registries publish absolute tarball URLs (e.g.
 // https://registry.example.com/pkg/-/pkg-1.0.0.tgz) that may be unreachable or
 // self-referential behind a reverse proxy; rewriting them to point back at this

@@ -26,6 +26,10 @@ go.work.sum
 
 # Build output
 npm-auto-proxy
+npm-auto-proxy-v*-linux-amd64
+npm-auto-proxy-v*-linux-arm64
+npm-auto-proxy-v*-darwin-*
+npm-auto-proxy-v*-windows-*
 
 # env file
 .env
